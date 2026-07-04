@@ -127,6 +127,11 @@ class ZofFlatCfg(LeggedRobotCfg):
             foot_bezier_tracking = -3.0
             foot_lateral_deviation = -8.0
             contact_schedule = -0.6
+            stand_base_motion = -2.0
+            stand_orientation_flat = -3.0
+            stand_joint_posture = -0.8
+            stand_foot_stance = -2.0
+            stand_foot_contact = -0.5
 
     class gait:
         # Trot reference: FL/RR and FR/RL move as diagonal pairs.
@@ -160,11 +165,12 @@ class ZofFlatCfg(LeggedRobotCfg):
         num_commands = 4
         resampling_time = 10.0
         heading_command = False
+        stand_probability = 0.25
 
         class ranges(LeggedRobotCfg.commands.ranges):
-            lin_vel_x = [0.3, 0.8]
+            lin_vel_x = [0.0, 0.8]
             lin_vel_y = [0.0, 0.0]
-            ang_vel_yaw = [0.0, 0.0]
+            ang_vel_yaw = [-0.8, 0.8]
             heading = [-3.14, 3.14]
 
 

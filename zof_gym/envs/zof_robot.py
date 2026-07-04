@@ -64,6 +64,25 @@ class ZofRobot(LeggedRobot):
         self.reset_buf |= fallen
         self.reset_buf |= too_low
 
+    def _resample_commands(self, env_ids):
+        super()._resample_commands(env_ids)
+
+        stand_probability = getattr(self.cfg.commands, "stand_probability", 0.0)
+        if stand_probability <= 0.0 or len(env_ids) == 0:
+            return
+
+        stand = torch.rand(len(env_ids), device=self.device) < stand_probability
+        stand_env_ids = env_ids[stand]
+        if len(stand_env_ids) > 0:
+            self.commands[stand_env_ids, 0:3] = 0.0
+
+    def _stand_command_mask(self):
+        return (
+            (torch.abs(self.commands[:, 0]) < 0.05)
+            & (torch.abs(self.commands[:, 1]) < 0.05)
+            & (torch.abs(self.commands[:, 2]) < 0.10)
+        )
+
     def _get_gait_phase(self):
         phase = self.episode_length_buf.float().unsqueeze(1) * self.dt
         phase = phase * self.cfg.gait.frequency + self.leg_phase_offsets
@@ -100,6 +119,8 @@ class ZofRobot(LeggedRobot):
         swing = phase >= duty
 
         cmd_x = torch.clamp(self.commands[:, 0], min=0.0).unsqueeze(1)
+        stand = self._stand_command_mask().unsqueeze(1)
+
         step_length = self.cfg.gait.step_length + self.cfg.gait.step_length_command_gain * cmd_x
         step_length = torch.clamp(
             step_length,
@@ -117,6 +138,10 @@ class ZofRobot(LeggedRobot):
 
         x_delta = torch.where(swing, x_swing, x_stance)
         z_delta = torch.where(swing, z_swing, torch.zeros_like(z_swing))
+
+        # stand mask：命令速度低于阈值时关闭踏步，原地站立
+        x_delta = torch.where(stand, torch.zeros_like(x_delta), x_delta)
+        z_delta = torch.where(stand, torch.zeros_like(z_delta), z_delta)
 
         foot_x = self.default_foot_x + x_delta
         foot_z = self.default_foot_z + z_delta
@@ -196,6 +221,35 @@ class ZofRobot(LeggedRobot):
         expected_contact = phase < self.cfg.gait.duty_factor
         actual_contact = self.contact_forces[:, self.feet_indices, 2] > 1.0
         return torch.mean(torch.abs(expected_contact.float() - actual_contact.float()), dim=1)
+
+    def _reward_stand_base_motion(self):
+        stand = self._stand_command_mask().float()
+        lin_xy = torch.sum(torch.square(self.base_lin_vel[:, :2]), dim=1)
+        yaw = torch.square(self.base_ang_vel[:, 2])
+        return stand * (lin_xy + yaw)
+
+    def _reward_stand_orientation_flat(self):
+        stand = self._stand_command_mask().float()
+        return stand * torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+
+    def _reward_stand_joint_posture(self):
+        stand = self._stand_command_mask().float()
+        error = self.dof_pos - self.default_dof_pos
+        return stand * torch.sum(torch.square(error), dim=1)
+
+    def _reward_stand_foot_stance(self):
+        stand = self._stand_command_mask().float()
+        foot_pos = self._get_foot_positions_body()
+        target = self.gait_target_foot_pos_body
+        error = foot_pos - target
+        weights = torch.tensor([1.0, 0.5, 1.0], dtype=torch.float, device=self.device)
+        return stand * torch.sum(torch.square(error) * weights.view(1, 1, 3), dim=(1, 2))
+
+    def _reward_stand_foot_contact(self):
+        stand = self._stand_command_mask().float()
+        contact = self.contact_forces[:, self.feet_indices, 2] > 1.0
+        missing_contacts = 4.0 - torch.sum(contact.float(), dim=1)
+        return stand * missing_contacts
 
     def compute_observations(self):
         self.obs_buf = torch.cat(

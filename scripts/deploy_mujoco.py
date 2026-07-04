@@ -25,11 +25,11 @@ import torch
 # ---------------------------------------------------------------------------
 REPO_ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 XML_PATH    = os.path.join(REPO_ROOT, "resources", "robots", "zof", "xml", "zof_deploy_from_urdf.xml")
-POLICY_PATH = os.path.join(
+DEFAULT_POLICY_PATH = os.path.join(
     REPO_ROOT,
     "resources", "policies", "zof_flat",
-    "Jul02_16-33-17_ppo_v5_ik_residual_bezier",
-    "checkpoint_3000", "policy.pt",
+    "Jul04_19-37-52_ppo_v7_stand_corrected_flat",
+    "checkpoint_1500", "policy.pt",
 )
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ def ik_xz(x, z):
     return thigh, calf
 
 
-def compute_gait_reference(policy_step: int, cmd_vx: float) -> np.ndarray:
+def compute_gait_reference(policy_step: int, cmd_vx: float, cmd_wz: float = 0.0) -> np.ndarray:
     """返回 IK 步态基准关节角，训练顺序 (12,)"""
     t = policy_step * POLICY_DT
     phase = np.mod(t * GAIT_FREQ + PHASE_OFFSETS, 1.0)
@@ -179,8 +179,11 @@ def quat_rotate_inverse_wxyz(q_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--headless", action="store_true", help="不开窗口，只打印数字")
-    p.add_argument("--steps",   type=int,   default=0,             help="物理步数（0=无限）")
-    p.add_argument("--cmd_vx",  type=float, default=CMD_VX_DEFAULT, help="前向速度指令 m/s")
+    p.add_argument("--steps", type=int, default=0, help="物理步数（0=无限）")
+    p.add_argument("--policy_path", type=str, default=DEFAULT_POLICY_PATH, help="TorchScript policy.pt 路径")
+    p.add_argument("--cmd_vx", type=float, default=CMD_VX_DEFAULT, help="W 前进速度指令 m/s")
+    p.add_argument("--turn_wz", type=float, default=0.5, help="A/D 原地转向角速度指令 rad/s")
+    p.add_argument("--headless_mode", choices=["stand", "forward", "left", "right"], default="forward", help="headless 自动运行的命令模式")
     p.add_argument("--kp", type=float, default=KP, help="部署 PD 位置增益")
     p.add_argument("--kd", type=float, default=KD, help="部署 PD 速度增益")
     return p.parse_args()
@@ -289,6 +292,7 @@ def make_step_fn(model, data, policy, q_idx, v_idx, act_idx, command_state, kp, 
         if phys_step[0] % DECIMATION == 0:
             # 从 command_state 读当前指令
             cmd_vx_now = command_state["vx"]
+            cmd_wz_now = command_state["wz"]
             stand_now  = command_state["stand"]
 
             # 读关节状态（训练顺序）
@@ -308,7 +312,7 @@ def make_step_fn(model, data, policy, q_idx, v_idx, act_idx, command_state, kp, 
             cmd_scaled = np.array([
                 cmd_vx_now * CMD_LIN_VEL_SCALE,
                 0.0,
-                0.0,
+                cmd_wz_now * CMD_ANG_VEL_SCALE,
             ])
 
             # 构造 45 维观测
@@ -322,15 +326,14 @@ def make_step_fn(model, data, policy, q_idx, v_idx, act_idx, command_state, kp, 
             ]).astype(np.float32)
 
             # 策略推理 + IK 基准 → 只更新 target_q_hold
+            with torch.no_grad():
+                action = policy(torch.from_numpy(obs).unsqueeze(0)).squeeze(0).numpy()
+
             if stand_now:
-                # 站立模式：不跑 policy residual，target_q = DEFAULT_Q_TRAIN
-                action = np.zeros(12)
-                ref_q  = DEFAULT_Q_TRAIN.copy()
+                # 站立命令也交给 policy，只是 reference 切回 default_q
+                ref_q = DEFAULT_Q_TRAIN.copy()
             else:
-                # 前进模式：跑 policy，cmd_vx 来自 command_state
-                with torch.no_grad():
-                    action = policy(torch.from_numpy(obs).unsqueeze(0)).squeeze(0).numpy()
-                ref_q = compute_gait_reference(policy_step[0], cmd_vx_now)
+                ref_q = compute_gait_reference(policy_step[0], cmd_vx_now, cmd_wz_now)
 
             last_action[:] = action
 
@@ -366,9 +369,17 @@ def make_step_fn(model, data, policy, q_idx, v_idx, act_idx, command_state, kp, 
 
         # 每 100 步打印一次
         if phys_step[0] % 100 == 0:
-            h  = data.qpos[2]
+            h = data.qpos[2]
             vx = data.qvel[0]
-            print(f"  phys={phys_step[0]:5d}  height={h:.3f} m  vx={vx:.3f} m/s")
+            wz = data.qvel[5]
+            cmd_vx = command_state["vx"]
+            cmd_wz = command_state["wz"]
+            mode = "stand" if command_state["stand"] else "move"
+            print(
+                f"  phys={phys_step[0]:5d}  mode={mode:5s} "
+                f"cmd=({cmd_vx:.2f},{cmd_wz:.2f}) "
+                f"height={h:.3f} m  vx={vx:.3f} m/s  wz={wz:.3f} rad/s"
+            )
 
         return phys_step[0]
 
@@ -402,8 +413,8 @@ def run(args):
     # ------------------------------------------------------------------
     # 4. 加载策略
     # ------------------------------------------------------------------
-    print(f"[deploy] 加载策略: {POLICY_PATH}")
-    policy = torch.jit.load(POLICY_PATH, map_location="cpu")
+    print(f"[deploy] 加载策略: {args.policy_path}")
+    policy = torch.jit.load(args.policy_path, map_location="cpu")
     policy.eval()
 
     # ------------------------------------------------------------------
@@ -412,25 +423,48 @@ def run(args):
     print(f"  deploy_pd: kp={args.kp:.2f}  kd={args.kd:.2f}")
 
     command_state = {
-        "vx":    0.0,
+        "vx": 0.0,
+        "wz": 0.0,
         "stand": True,
     }
 
+    def set_command(vx, wz, stand):
+        command_state["vx"] = vx
+        command_state["wz"] = wz
+        command_state["stand"] = stand
+
     def key_callback(keycode):
         if keycode == ord("W"):
-            command_state["vx"]    = args.cmd_vx
-            command_state["stand"] = False
+            set_command(args.cmd_vx, 0.0, False)
             print(f"[key] W: walk forward vx={args.cmd_vx}")
+        elif keycode == ord("A"):
+            set_command(0.0, args.turn_wz, False)
+            print(f"[key] A: turn left wz={args.turn_wz}")
+        elif keycode == ord("D"):
+            set_command(0.0, -args.turn_wz, False)
+            print(f"[key] D: turn right wz={-args.turn_wz}")
         elif keycode == ord("S"):
-            command_state["vx"]    = 0.0
-            command_state["stand"] = True
+            set_command(0.0, 0.0, True)
             print("[key] S: stand")
 
     step_fn = make_step_fn(model, data, policy, q_idx, v_idx, act_idx, command_state, args.kp, args.kd)
     max_steps = args.steps if args.steps > 0 else 10**9
 
     if args.headless:
-        print(f"[deploy] headless，运行 {args.steps or '∞'} 物理步 ...")
+        if args.headless_mode == "stand":
+            set_command(0.0, 0.0, True)
+        elif args.headless_mode == "forward":
+            set_command(args.cmd_vx, 0.0, False)
+        elif args.headless_mode == "left":
+            set_command(0.0, args.turn_wz, False)
+        elif args.headless_mode == "right":
+            set_command(0.0, -args.turn_wz, False)
+
+        print(
+            f"[deploy] headless，mode={args.headless_mode}，"
+            f"cmd=({command_state['vx']:.2f},{command_state['wz']:.2f})，"
+            f"运行 {args.steps or '∞'} 物理步 ..."
+        )
         phys = 0
         while phys < max_steps:
             phys = step_fn()
@@ -438,7 +472,7 @@ def run(args):
 
     else:
         print("[deploy] 启动 MuJoCo viewer，关闭窗口或 Ctrl+C 退出")
-        print(f"[deploy] 键盘: W=前进(vx={args.cmd_vx})  S=站立")
+        print(f"[deploy] 键盘: W=前进(vx={args.cmd_vx})  A=左转(wz={args.turn_wz})  D=右转(wz={-args.turn_wz})  S=站立")
         with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
             viewer.cam.distance  = 2.0
             viewer.cam.elevation = -20
