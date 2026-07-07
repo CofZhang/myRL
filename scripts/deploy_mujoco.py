@@ -183,7 +183,7 @@ def parse_args():
     p.add_argument("--policy_path", type=str, default=DEFAULT_POLICY_PATH, help="TorchScript policy.pt 路径")
     p.add_argument("--cmd_vx", type=float, default=CMD_VX_DEFAULT, help="W 前进速度指令 m/s")
     p.add_argument("--turn_wz", type=float, default=0.5, help="A/D 原地转向角速度指令 rad/s")
-    p.add_argument("--headless_mode", choices=["stand", "forward", "left", "right"], default="forward", help="headless 自动运行的命令模式")
+    p.add_argument("--headless_mode", choices=["stand", "forward", "left", "right", "stop"], default="forward", help="headless 自动运行的命令模式；stop=前半段 forward，半程切 S 站立")
     p.add_argument("--kp", type=float, default=KP, help="部署 PD 位置增益")
     p.add_argument("--kd", type=float, default=KD, help="部署 PD 速度增益")
     return p.parse_args()
@@ -341,7 +341,7 @@ def make_step_fn(model, data, policy, q_idx, v_idx, act_idx, command_state, kp, 
 
             if stand_now:
                 # S 站立：限速过渡到 DEFAULT_Q，避免瞬间跳变
-                max_target_rate = 2.0  # rad/s
+                max_target_rate = 1.5  # rad/s
                 max_delta = max_target_rate * POLICY_DT
                 delta = np.clip(
                     target_q_new - target_q_hold,
@@ -387,39 +387,26 @@ def make_step_fn(model, data, policy, q_idx, v_idx, act_idx, command_state, kp, 
 
 
 def run(args):
-    # ------------------------------------------------------------------
     # 1. 加载 MuJoCo 模型
-    # ------------------------------------------------------------------
     print(f"[deploy] 加载模型: {XML_PATH}")
     model = mujoco.MjModel.from_xml_path(XML_PATH)
     data  = mujoco.MjData(model)
     model.opt.timestep = SIM_DT
     print(f"  nu={model.nu}  nq={model.nq}  nv={model.nv}")
 
-    # ------------------------------------------------------------------
     # 2. 建索引映射（按名字查，不依赖顺序）
-    # ------------------------------------------------------------------
     q_idx, v_idx, act_idx = build_index_maps(model)
     print(f"  act_idx (训练顺序→ctrl索引): {act_idx.tolist()}")
-
-    # ------------------------------------------------------------------
     # 3. 初始姿态
-    # ------------------------------------------------------------------
     mujoco.mj_resetData(model, data)
     foot_geom_ids = find_foot_sphere_geoms(model)
     init_height = set_default_pose_on_ground(model, data, q_idx, foot_geom_ids)
     print(f"  init_height={init_height:.3f} m  init_pitch={INIT_PITCH:.3f} rad  foot_geom_ids={foot_geom_ids.tolist()}")
-
-    # ------------------------------------------------------------------
     # 4. 加载策略
-    # ------------------------------------------------------------------
     print(f"[deploy] 加载策略: {args.policy_path}")
     policy = torch.jit.load(args.policy_path, map_location="cpu")
     policy.eval()
-
-    # ------------------------------------------------------------------
     # 5. 运行
-    # ------------------------------------------------------------------
     print(f"  deploy_pd: kp={args.kp:.2f}  kd={args.kd:.2f}")
 
     command_state = {
@@ -459,6 +446,9 @@ def run(args):
             set_command(0.0, args.turn_wz, False)
         elif args.headless_mode == "right":
             set_command(0.0, -args.turn_wz, False)
+        elif args.headless_mode == "stop":
+            # stop 一开始等价于 forward，半程切 S
+            set_command(args.cmd_vx, 0.0, False)
 
         print(
             f"[deploy] headless，mode={args.headless_mode}，"
@@ -467,6 +457,9 @@ def run(args):
         )
         phys = 0
         while phys < max_steps:
+            if args.headless_mode == "stop" and phys == args.steps // 2:
+                set_command(0.0, 0.0, True)
+                print(f"[deploy] step {phys}: 切换到 stand（S 刹车测试）")
             phys = step_fn()
         print("[deploy] 完成")
 
